@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OPTCG Decklist Converter</title>
-<meta name="description" content="Convert One Piece TCG decklists from Egman Events format to Cardmarket wants list import format.">
+<meta name="description" content="Convert One Piece TCG decklists from Egman Events or gumgum.gg format to Cardmarket wants list import format.">
 <style>
   :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
   body { max-width: 960px; margin: 0 auto; padding: 24px 16px; line-height: 1.5; }
@@ -18,18 +18,18 @@
   .bar label { display: inline; font-weight: normal; margin: 0; }
   button { font: inherit; padding: 4px 14px; cursor: pointer; }
   #status { opacity: .75; }
-  #skipped { color: #d33; font-size: .85rem; white-space: pre-wrap; margin-top: 8px; }
+  #notes { color: #d33; font-size: .85rem; white-space: pre-wrap; margin-top: 8px; }
 </style>
 </head>
 <body>
-<h1>Egman → Cardmarket</h1>
-<p>Paste a One Piece TCG decklist exported from Egman Events. Paste the result into a
+<h1>Egman / gumgum.gg → Cardmarket</h1>
+<p>Paste a One Piece TCG decklist exported from Egman Events or gumgum.gg. Paste the result into a
   <a href="https://www.cardmarket.com/en/OnePiece/Wants" target="_blank" rel="noopener">Cardmarket wants list</a>.</p>
 
 <div class="grid">
   <div>
-    <label for="input">Egman decklist</label>
-    <textarea id="input" spellcheck="false" placeholder="1 OP01-001 Roronoa Zoro&#10;4 OP01-016 Nami&#10;4 OP01-025 Roronoa Zoro"></textarea>
+    <label for="input">Decklist</label>
+    <textarea id="input" spellcheck="false" placeholder="1 OP01-001 Roronoa Zoro&#10;4 OP01-016 Nami&#10;&#10;or&#10;&#10;1xOP01-001&#10;4xOP01-016"></textarea>
     <div class="bar">
       <label><input type="checkbox" id="side"> Include "Other Cards"</label>
     </div>
@@ -43,13 +43,18 @@
     </div>
   </div>
 </div>
-<div id="skipped"></div>
+<div id="notes"></div>
 
 <script>
-  // "4 OP01-016 Nami" (Egman), also "4xOP01-016" (OPTCG Sim). Variant suffixes on the code are dropped.
+  // "4 OP01-016 Nami" (Egman), also "4xOP01-016" (gumgum.gg, OPTCG Sim). Variant suffixes on the code are dropped.
   const LINE = /^(\d+)\s*x?\s*([A-Z]+\d*-\d+)\S*\s*(.*)$/i;
 
-  function convert(text, includeSide) {
+  // Official English card names by code, for decklists that only list codes.
+  const CARDS_URL = "https://raw.githubusercontent.com/buhbbl/punk-records/main/english/index/cards_by_id.json";
+  let names = null;    // Map of code → name, once loaded
+  let lookup = "idle"; // "loading" | "done" | "failed"
+
+  function convert(text, includeSide, names) {
     const cards = new Map();
     const skipped = [];
     let side = false;
@@ -61,24 +66,51 @@
       if (!m) { skipped.push(line); continue; }
       if (side && !includeSide) continue;
       const code = m[2].toUpperCase();
-      // Cardmarket reads "(...)" as a version, so "Mr.3(Galdino)" becomes "Mr.3 Galdino".
-      const name = m[3].replace(/\(([^)]*)\)/g, " $1 ").replace(/\s+/g, " ").trim();
-      const card = cards.get(code) || { count: 0, name };
+      const card = cards.get(code) || { count: 0, name: "" };
       card.count += Number(m[1]);
+      card.name ||= m[3];
       cards.set(code, card);
     }
-    const lines = [...cards].map(([code, c]) => `${c.count}x ${c.name ? c.name + " " : ""}${code}`);
+    const unnamed = [];
+    const lines = [...cards].map(([code, c]) => {
+      // Cardmarket reads "(...)" as a version, so "Mr.3(Galdino)" becomes "Mr.3 Galdino".
+      const name = (c.name || names?.get(code) || "").replace(/\(([^)]*)\)/g, " $1 ").replace(/\s+/g, " ").trim();
+      if (!name) unnamed.push(code);
+      return `${c.count}x ${name ? name + " " : ""}${code}`;
+    });
     const total = [...cards.values()].reduce((sum, c) => sum + c.count, 0);
-    return { output: lines.join("\n"), total, unique: cards.size, skipped };
+    return { output: lines.join("\n"), total, unique: cards.size, skipped, unnamed };
   }
 
   const $ = (id) => document.getElementById(id);
 
+  // The card data escapes names as HTML ("Ace &amp; Newgate").
+  const decoder = document.createElement("textarea");
+  const decodeHtml = (s) => { decoder.innerHTML = s; return decoder.value; };
+
+  function loadNames() {
+    lookup = "loading";
+    fetch(CARDS_URL)
+      .then((res) => { if (!res.ok) throw new Error(res.statusText); return res.json(); })
+      .then((data) => {
+        names = new Map(Object.entries(data).map(([code, card]) => [code, decodeHtml(card.name)]));
+        lookup = "done";
+      })
+      .catch(() => { lookup = "failed"; })
+      .finally(update);
+  }
+
   function update() {
-    const r = convert($("input").value, $("side").checked);
+    const r = convert($("input").value, $("side").checked, names);
+    if (r.unnamed.length && lookup === "idle") loadNames();
     $("output").value = r.output;
-    $("status").textContent = r.total ? `${r.total} cards, ${r.unique} unique` : "";
-    $("skipped").textContent = r.skipped.length ? `Couldn't read:\n${r.skipped.join("\n")}` : "";
+    const loading = r.unnamed.length && lookup === "loading" ? " · looking up card names…" : "";
+    $("status").textContent = r.total ? `${r.total} cards, ${r.unique} unique${loading}` : "";
+    const notes = [];
+    if (r.skipped.length) notes.push(`Couldn't read:\n${r.skipped.join("\n")}`);
+    if (r.unnamed.length && lookup === "failed") notes.push("Couldn't load card names. Reload the page to try again.");
+    if (r.unnamed.length && lookup === "done") notes.push(`No card name found for:\n${r.unnamed.join("\n")}`);
+    $("notes").textContent = notes.join("\n\n");
   }
 
   $("input").addEventListener("input", update);
